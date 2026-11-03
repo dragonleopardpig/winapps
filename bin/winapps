@@ -51,6 +51,8 @@ RDP_FLAGS=""
 FREERDP_COMMAND=""
 REMOVABLE_MEDIA=""
 RDP_SCALE=100
+RDP_DESKTOP_SCALE=100
+RDP_FULLSCREEN=0
 AUTOPAUSE="off"
 AUTOPAUSE_TIME="300"
 DEBUG="true"
@@ -63,6 +65,7 @@ RDP_FLAGS_NON_WINDOWS=""
 
 # OTHER
 FREERDP_PID=-1
+FREERDP_CLIENT_PID=-1
 NEEDED_BOOT=false
 
 ### TRAPS ###
@@ -70,9 +73,49 @@ NEEDED_BOOT=false
 trap waKillCleanExit SIGINT SIGTERM
 
 ### FUNCTIONS ###
+function waFindFreeRDPProcess() {
+    local PROCESS_PID="$1"
+    local PROCESS_NAME=""
+    local CHILD_PID=""
+    local CHILDREN_FILE=""
+    local CHILD_PIDS=()
+
+    [[ -r "/proc/$PROCESS_PID/comm" ]] || return 1
+    read -r PROCESS_NAME < "/proc/$PROCESS_PID/comm" || return 1
+    if [[ "$PROCESS_NAME" == *freerdp* ]]; then
+        printf '%s\n' "$PROCESS_PID"
+        return 0
+    fi
+    for CHILDREN_FILE in "/proc/$PROCESS_PID/task/"*/children; do
+        [[ -r "$CHILDREN_FILE" ]] || continue
+        CHILD_PIDS=()
+        read -r -a CHILD_PIDS < "$CHILDREN_FILE" || true
+        for CHILD_PID in "${CHILD_PIDS[@]}"; do
+            if waFindFreeRDPProcess "$CHILD_PID"; then
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+function waTrackFreeRDPProcess() {
+    local TRACK_ATTEMPT=0
+    for (( TRACK_ATTEMPT=0; TRACK_ATTEMPT<50; TRACK_ATTEMPT++ )); do
+        if FREERDP_CLIENT_PID=$(waFindFreeRDPProcess "$FREERDP_PID"); then
+            touch -- "${APPDATA_PATH}/FreeRDP_Process_${FREERDP_CLIENT_PID}.cproc"
+            return 0
+        fi
+        [[ -d "/proc/$FREERDP_PID" ]] || return 1
+        sleep 0.1
+    done
+    return 1
+}
+
 # Name: 'waCleanFreeRDP'
 # Role: Clean up remains prior to exit.
 function waCleanFreeRDP() {
+    local RESOLVED_PID=""
     for proc_file in "${APPDATA_PATH}"/FreeRDP_Process_*.cproc; do
         # Protect against glob non-expansion.
         [[ -f "$proc_file" ]] || break
@@ -88,7 +131,12 @@ function waCleanFreeRDP() {
 
         if [[ "$cproc" =~ ^[0-9]+$ ]]; then
             # Proceed if process dir missing OR comm unreadable OR name doesn’t match.
-            if [[ ! -d "/proc/$cproc" ]] || [[ ! -r "/proc/$cproc/comm" ]] || [[ $(<"/proc/$cproc/comm") != *freerdp* ]]; then
+            if RESOLVED_PID=$(waFindFreeRDPProcess "$cproc"); then
+                if [[ "$RESOLVED_PID" != "$cproc" ]]; then
+                    touch -- "${APPDATA_PATH}/FreeRDP_Process_${RESOLVED_PID}.cproc"
+                    rm -- "$proc_file" &>/dev/null
+                fi
+            else
                 # Delete the file.
                 rm -- "$proc_file" &>/dev/null
             fi
@@ -201,6 +249,7 @@ function waEarlyDispatch() {
         waHelp
         exit 0
     elif [[ "$1" == "killrdp" ]]; then
+        waCleanFreeRDP
         waKillFreeRDP
         waCleanFreeRDP
         exit 0
@@ -374,6 +423,12 @@ function waLoadConfig() {
     fi
 
     RDP_PORT="${RDP_PORT:-3389}"
+    if [[ ! "$RDP_DESKTOP_SCALE" =~ ^[1-5][0-9]{2}$ ]] || (( RDP_DESKTOP_SCALE > 500 )); then
+        RDP_DESKTOP_SCALE=100
+    fi
+    if [[ "$RDP_FULLSCREEN" != "1" ]]; then
+        RDP_FULLSCREEN=0
+    fi
 
     # Update $RDP_SCALE.
     waFixScale
@@ -658,7 +713,7 @@ function waCheckContainerRunning() {
         "created")
             dprint "WINDOWS CREATED. BOOTING WINDOWS."
             notify-send --expire-time=4000 --icon="dialog-info" --app-name="WinApps" --app-icon="$APP_ICON_PATH" --urgency="low" "WinApps" "Booting Windows."
-            $COMPOSE_COMMAND --file "$COMPOSE_PATH" start &>/dev/null
+            $COMPOSE_COMMAND --file "$COMPOSE_PATH" up -d &>/dev/null || EXIT_STATUS=$EC_FAIL_START
             NEEDED_BOOT=true
             ;;
         "restarting")
@@ -685,7 +740,7 @@ function waCheckContainerRunning() {
         "exited")
             dprint "WINDOWS SHUT OFF. BOOTING WINDOWS."
             notify-send --expire-time=4000 --icon="dialog-info" --app-name="WinApps" --app-icon="$APP_ICON_PATH" --urgency="low" "WinApps" "Booting Windows."
-            $COMPOSE_COMMAND --file "$COMPOSE_PATH" start &>/dev/null
+            $COMPOSE_COMMAND --file "$COMPOSE_PATH" up -d &>/dev/null || EXIT_STATUS=$EC_FAIL_START
             NEEDED_BOOT=true
             ;;
         "dead")
@@ -812,26 +867,38 @@ function waRunCommand() {
     # Declare variables.
     local ICON=""
     local FILE_PATH=""
+    local WIN_ARGUMENTS=""
+    local WINDOWS_FLAGS=()
+    local FREERDP_STATUS=0
+    local WINDOWS_LOG="${APPDATA_PATH}/freerdp-windows.log"
 
     # Run option.
     if [ "$1" = "windows" ]; then
+        if [[ "$RDP_FULLSCREEN" == "1" ]]; then
+            WINDOWS_FLAGS+=(/f)
+        fi
         # Update timeout (since there is no 'in-built' 20 second delay for full RDP sessions post-logout).
         AUTOPAUSE_TIME=$((AUTOPAUSE_TIME + 20))
 
         # Open Windows RDP session.
         dprint "WINDOWS"
+        (umask 077; : > "$WINDOWS_LOG")
+        chmod 0600 "$WINDOWS_LOG"
         # shellcheck disable=SC2086 #Disable warning for globbing and word splitting
         $FREERDP_COMMAND \
             $RDP_FLAGS_WINDOWS \
+            "${WINDOWS_FLAGS[@]}" \
+            -grab-keyboard \
             /d:"$RDP_DOMAIN" \
             /u:"$RDP_USER" \
             ${RDP_PASSWORD_ARG:+"$RDP_PASSWORD_ARG"} \
             /scale:"$RDP_SCALE" \
             +auto-reconnect \
             +dynamic-resolution \
+            /scale-desktop:"$RDP_DESKTOP_SCALE" \
             /wm-class:"Microsoft Windows" \
             /t:"Windows RDP Session [$RDP_IP]" \
-            /v:"$RDP_IP":"$RDP_PORT" &>/dev/null &
+            /v:"$RDP_IP":"$RDP_PORT" &>"$WINDOWS_LOG" &
 
         # Capture the process ID.
         FREERDP_PID=$!
@@ -869,6 +936,10 @@ function waRunCommand() {
             waThrowExit "$EC_UNSUPPORTED_APP"
         fi
 
+        if [[ ! -f "$ICON" && -f "${ICON%.svg}.png" ]]; then
+            ICON="${ICON%.svg}.png"
+        fi
+
         # Check if a file path was specified, and pass this to the application.
         if [ -z "$2" ]; then
             # No file path specified.
@@ -881,7 +952,7 @@ function waRunCommand() {
                 /scale:"$RDP_SCALE" \
                 +auto-reconnect \
                 /wm-class:"$FULL_NAME" \
-                /app:program:"$WIN_EXECUTABLE",hidef:"$HIDEF",icon:"$ICON",name:"$FULL_NAME" \
+                /app:program:"$WIN_EXECUTABLE",hidef:"$HIDEF",icon:"$ICON",name:"$FULL_NAME""${WIN_ARGUMENTS:+,cmd:$WIN_ARGUMENTS}" \
                 /v:"$RDP_IP":"$RDP_PORT" &>/dev/null &
 
             # Capture the process ID.
@@ -916,13 +987,13 @@ function waRunCommand() {
     if [[ "$RDP_FLATPAK" == "0" ]]; then
         if [ "$FREERDP_PID" -ne -1 ]; then
             # Create a file with the process ID.
-            touch -- "${APPDATA_PATH}/FreeRDP_Process_${FREERDP_PID}.cproc"
+            waTrackFreeRDPProcess
 
             # Wait for the process to terminate.
-            wait "$FREERDP_PID"
+            wait "$FREERDP_PID" || FREERDP_STATUS=$?
 
             # Remove the file with the process ID.
-            rm -- "${APPDATA_PATH}/FreeRDP_Process_${FREERDP_PID}.cproc" &>/dev/null
+            rm -- "${APPDATA_PATH}/FreeRDP_Process_${FREERDP_CLIENT_PID}.cproc" &>/dev/null
         fi
     else
         # Create a file.
@@ -936,6 +1007,7 @@ function waRunCommand() {
         # Remove the file.
         rm -- "${APPDATA_PATH}/FreeRDP_Process_Flatpak.cproc" &>/dev/null
     fi
+    return "$FREERDP_STATUS"
 }
 
 # Name: 'waCheckIdle'
@@ -948,10 +1020,12 @@ function waCheckIdle() {
 
     # Prevent 'autopause' functionality with unsupported Windows backends.
     if [ "$WAFLAVOR" != "manual" ]; then
+        waCleanFreeRDP
         # Check if there are no WinApps-related FreeRDP processes running.
         if ! ls "$APPDATA_PATH"/FreeRDP_Process_*.cproc &>/dev/null; then
             SUSPEND_WINDOWS=1
             while (( TIME_ELAPSED < AUTOPAUSE_TIME )); do
+                waCleanFreeRDP
                 if ls "$APPDATA_PATH"/FreeRDP_Process_*.cproc &>/dev/null; then
                     SUSPEND_WINDOWS=0
                     break
@@ -963,6 +1037,10 @@ function waCheckIdle() {
 
         # Hibernate/Pause Windows.
         if [ "$SUSPEND_WINDOWS" -eq 1 ]; then
+            waCleanFreeRDP
+            if ls "$APPDATA_PATH"/FreeRDP_Process_*.cproc &>/dev/null; then
+                return
+            fi
             dprint "IDLE FOR ${AUTOPAUSE_TIME} SECONDS. SUSPENDING WINDOWS."
             notify-send --expire-time=8000 --icon="info" --app-name="WinApps" --app-icon="$APP_ICON_PATH" --urgency="low" "WinApps" "Pausing Windows due to inactivity."
             if [ "$WAFLAVOR" = "docker" ]; then
@@ -1109,7 +1187,7 @@ else
     waCheckPortOpen
 fi
 waTimeSync
-waRunCommand "$@"
+waRunCommand "$@" || exit "$?"
 
 if [[ "$AUTOPAUSE" == "on" ]]; then
     waCheckIdle

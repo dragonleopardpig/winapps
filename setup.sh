@@ -1459,6 +1459,15 @@ function waConfigureApp() {
     # shellcheck source=/dev/null # Exclude this file from being checked by ShellCheck.
     source "${APPDATA_PATH}/apps/${1}/info"
 
+    local DESKTOP_CATEGORY=""
+    local DESKTOP_CATEGORIES=""
+    local CATEGORY_LIST=()
+    IFS=';' read -r -a CATEGORY_LIST <<< "$CATEGORIES"
+    for DESKTOP_CATEGORY in "${CATEGORY_LIST[@]}"; do
+        [[ "$DESKTOP_CATEGORY" == "WinApps" ]] && DESKTOP_CATEGORY="X-WinApps"
+        [[ -n "$DESKTOP_CATEGORY" ]] && DESKTOP_CATEGORIES+="${DESKTOP_CATEGORY};"
+    done
+
     # Determine path to application icon using arguments passed to function.
     APP_ICON="${APPDATA_PATH}/apps/${1}/icon.${2}"
 
@@ -1477,7 +1486,7 @@ Type=Application
 Icon=${APP_ICON}
 StartupWMClass=${FULL_NAME}
 Comment=${FULL_NAME}
-Categories=${CATEGORIES}
+Categories=${DESKTOP_CATEGORIES}
 MimeType=${MIME_TYPES}"
 
     # Store the '.desktop' file for the application.
